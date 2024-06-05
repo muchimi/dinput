@@ -587,7 +587,7 @@ void initialize_device(GUID guid, std::string name)
     prop_word.dwData = g_buffer_size;
     // By default assume the device supports buffered reading and revert
     // to polled upon failure
-    g_data_store.is_buffered[guid] = true;
+    g_data_store.is_buffered[guid] = false;  // changed to default polling to avoid buffer errors as most sticks don't support buffering
     result = device->SetProperty(DIPROP_BUFFERSIZE, &prop_header);
     if(FAILED(result))
     {
