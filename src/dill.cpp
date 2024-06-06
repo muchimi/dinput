@@ -20,7 +20,7 @@ namespace spd = spdlog;
 
 // Setup logger
 //auto logger = spd::stdout_color_mt("console");
-auto logger = spd::basic_logger_mt("debug", "debug.txt");
+auto logger = spd::basic_logger_mt("debug", "dill_debug.txt");
 
 // DirectInput system handle
 LPDIRECTINPUT8 g_direct_input = nullptr;
