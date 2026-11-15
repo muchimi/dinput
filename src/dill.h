@@ -8,6 +8,8 @@
 #include <dinput.h>
 
 #include <mutex>
+#include <vector>
+#include <cstdint>
 #include <string>
 #include <stdexcept>
 #include <unordered_map>
@@ -100,6 +102,8 @@ struct DeviceSummary
     DWORD                               button_count;
     DWORD                               hat_count;
     AxisMap                             axis_map[8];
+    WORD                                usage_page;
+    WORD                                usage;
 };
 
 /**
@@ -175,7 +179,7 @@ BOOL on_device_change(LPARAM l_param, WPARAM w_param);
 /**
  * \brief Handles messages from Windows' messaging system.
  */
-LRESULT window_proc(
+LRESULT CALLBACK window_proc(
     HWND                                window_hdl,
     UINT                                msg_type,
     WPARAM                              w_param,
@@ -237,7 +241,7 @@ void enumerate_devices();
  * \param guid GUID of the device to initialize
  * \param name name of the device being initialized
  */
-void initialize_device(GUID guid, std::string name);
+void initialize_device(GUID guid, std::string name, WORD usage_page = 0, WORD usage = 0);
 
 /**
  * \brief Returns the indices of axes used by the device.
@@ -275,8 +279,40 @@ DWORD get_product_id(LPDIRECTINPUTDEVICE8 device, GUID guid);
 DWORD get_joystick_id(LPDIRECTINPUTDEVICE8 device, GUID guid);
 
 
+// Versioned, fixed-width ABI description, filled only when size matches.
+struct DillAbiInfo
+{
+    DWORD api_version;
+    DWORD struct_size;
+    DWORD guid_size;
+    DWORD device_summary_size;
+    DWORD input_data_size;
+    DWORD axis_map_size;
+    DWORD usage_page_offset;
+    DWORD usage_offset;
+    DWORD input_type_offset;
+    DWORD input_index_offset;
+    DWORD input_value_offset;
+};
+
 extern "C"
 {
+    // Idempotent owner-thread shutdown. Joins callbacks before returning TRUE.
+    // A call from a native callback requests stop and returns FALSE/ERROR_BUSY;
+    // the owner must call shutdown again to join and release handles.
+    __declspec(dllexport) BOOL shutdown();
+    __declspec(dllexport) DWORD get_api_version();
+    __declspec(dllexport) BOOL is_initialized();
+    __declspec(dllexport) BOOL is_worker_thread();
+    __declspec(dllexport) BOOL get_abi_info(DillAbiInfo* info, size_t size);
+    // Errors belong to the calling thread; initialization failures are forwarded from the worker.
+    __declspec(dllexport) LONG get_last_error_code();
+    __declspec(dllexport) size_t get_last_error_message(char* buffer, size_t capacity);
+    // If capacity is too small, count reports the required size and buffer is untouched.
+    __declspec(dllexport) BOOL get_device_snapshot(DeviceSummary* buffer, size_t capacity, size_t* count, std::uint64_t* generation);
+    // Last initialization/poll HRESULT for this GUID; ERROR_NOT_FOUND when unknown.
+    __declspec(dllexport) LONG get_device_error(GUID guid);
+
     /**
      * \brief Initializes the library.
      */

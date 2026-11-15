@@ -15,22 +15,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="build\cmakefiles\3.20.6\compileridc\CMakeCCompilerId.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="build\cmakefiles\3.20.6\compileridcxx\CMakeCXXCompilerId.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="build\cmakefiles\showincludes\main.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="src\dill.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\example.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\example2.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -188,6 +173,9 @@
     <ClInclude Include="src\spdlog\sinks\wincolor_sink.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="resource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="build\cmakefiles\3.20.6\CMakeDetermineCompilerABI_C.bin">
@@ -196,5 +184,10 @@
     <None Include="build\cmakefiles\3.20.6\CMakeDetermineCompilerABI_CXX.bin">
       <Filter>Resource Files</Filter>
     </None>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="dill.rc">
+      <Filter>Resource Files</Filter>
+    </ResourceCompile>
   </ItemGroup>
 </Project>
