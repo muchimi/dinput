@@ -1,4 +1,13 @@
 #include "dill.h"
+#include <Xinput.h>
+#include <SetupAPI.h>
+#include <cfgmgr32.h>
+#include <initguid.h>
+#include <devpkey.h>
+#include <cwchar>
+#include <cctype>
+#include <iterator>
+#include <cwctype>
 
 #include <atomic>
 #include <iostream>
@@ -72,6 +81,30 @@ static std::unordered_map<GUID, HRESULT> g_device_errors;
 static std::unordered_map<GUID, DIDEVCAPS> g_device_capabilities;
 struct PollFailure { HRESULT code = S_OK; ULONGLONG last_log = 0; DWORD suppressed = 0; };
 static std::unordered_map<GUID, PollFailure> g_poll_failures;
+
+using XInputReadState = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
+using XInputReadCapabilities = DWORD (WINAPI*)(DWORD, DWORD, XINPUT_CAPABILITIES*);
+
+// Windows' optional XInput 1.4 extension provides the hardware IDs needed for labels.
+struct XInputExtendedCapabilities
+{
+    XINPUT_CAPABILITIES capabilities;
+    WORD vendor_id;
+    WORD product_id;
+    WORD product_version;
+    WORD reserved;
+    DWORD extra;
+};
+static_assert(sizeof(XInputExtendedCapabilities) == 32, "XInput extended capabilities layout");
+using XInputReadExtendedCapabilities = DWORD (WINAPI*)(DWORD, DWORD, DWORD, XInputExtendedCapabilities*);
+
+static HMODULE g_xinput_module = nullptr;
+static XInputReadState g_xinput_get_state = nullptr;
+static XInputReadCapabilities g_xinput_get_capabilities = nullptr;
+static XInputReadExtendedCapabilities g_xinput_get_extended_capabilities = nullptr;
+static bool g_xinput_checked = false;
+static ULONGLONG g_next_xinput_scan = 0;
+
 #ifdef DILL_TESTING
 static HRESULT (*g_test_enumerate)() = nullptr;
 static std::atomic<int> g_test_notifications{0};
@@ -365,15 +398,8 @@ void process_buffered_events(LPDIRECTINPUTDEVICE8 instance, GUID const& guid)
     }
 }
 
-void poll_device(LPDIRECTINPUTDEVICE8 instance, GUID const& guid)
+static void update_device_state(const DIJOYSTATE2& state, const GUID& guid)
 {
-    HRESULT result = poll_or_reacquire(instance);
-    if (FAILED(result)) { report_poll_failure(guid, result, "Poll/Acquire"); return; }
-    DIJOYSTATE2 state{};
-    result = instance->GetDeviceState(sizeof(state), &state);
-    if (FAILED(result)) { report_poll_failure(guid, result, "GetDeviceState"); return; }
-    report_poll_recovery(guid);
-
     // Event structure to use with the callback
     JoystickInputData evt{};
     evt.device_guid = guid;
@@ -448,12 +474,269 @@ void poll_device(LPDIRECTINPUTDEVICE8 instance, GUID const& guid)
     }
 }
 
+void poll_device(LPDIRECTINPUTDEVICE8 instance, GUID const& guid)
+{
+    HRESULT result = poll_or_reacquire(instance);
+    if (FAILED(result)) { report_poll_failure(guid, result, "Poll/Acquire"); return; }
+    DIJOYSTATE2 state{};
+    result = instance->GetDeviceState(sizeof(state), &state);
+    if (FAILED(result)) { report_poll_failure(guid, result, "GetDeviceState"); return; }
+    report_poll_recovery(guid);
+    update_device_state(state, guid);
+}
+
+static void load_xinput()
+{
+    if (g_xinput_checked) return;
+    g_xinput_checked = true;
+    g_xinput_module = LoadLibraryExW(L"xinput1_4.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!g_xinput_module) return;
+    g_xinput_get_state = reinterpret_cast<XInputReadState>(GetProcAddress(g_xinput_module, "XInputGetState"));
+    g_xinput_get_capabilities = reinterpret_cast<XInputReadCapabilities>(
+        GetProcAddress(g_xinput_module, "XInputGetCapabilities"));
+    g_xinput_get_extended_capabilities = reinterpret_cast<XInputReadExtendedCapabilities>(
+        GetProcAddress(g_xinput_module, MAKEINTRESOURCEA(108)));
+}
+
+static GUID xinput_guid(DWORD slot)
+{
+    // The last byte identifies the Windows XInput user slot (0 through 3).
+    return {0x6456D620, 0x99D9, 0x47B0, {0xAD, 0x76, 0x21, 0xFF, 0xED, 0xF4, 0xAE, static_cast<BYTE>(slot)}};
+}
+
+static DIJOYSTATE2 xinput_joystick_state(const XINPUT_GAMEPAD& pad)
+{
+    DIJOYSTATE2 state{};
+    state.lX = pad.sThumbLX;
+    state.lY = std::min<LONG>(32767, -static_cast<LONG>(pad.sThumbLY));
+    state.lRx = pad.sThumbRX;
+    state.lRy = std::min<LONG>(32767, -static_cast<LONG>(pad.sThumbRY));
+    state.lZ = static_cast<LONG>(pad.bLeftTrigger) * 257 - 32768;
+    state.lRz = static_cast<LONG>(pad.bRightTrigger) * 257 - 32768;
+
+    constexpr WORD button_masks[] = {
+        XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+        XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_BACK, XINPUT_GAMEPAD_START,
+        XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_THUMB
+    };
+    for (size_t index = 0; index < sizeof(button_masks) / sizeof(button_masks[0]); ++index)
+        state.rgbButtons[index] = (pad.wButtons & button_masks[index]) ? 0x80 : 0;
+
+    const int horizontal = !!(pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) - !!(pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT);
+    const int vertical = !!(pad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN) - !!(pad.wButtons & XINPUT_GAMEPAD_DPAD_UP);
+    constexpr DWORD hats[3][3] = {{31500, 0, 4500}, {27000, DWORD(-1), 9000}, {22500, 18000, 13500}};
+    std::fill(std::begin(state.rgdwPOV), std::end(state.rgdwPOV), DWORD(-1));
+    state.rgdwPOV[0] = hats[vertical + 1][horizontal + 1];
+    return state;
+}
+
+static void release_device_locked(GUID guid, bool notify);
+
+struct GamepadName
+{
+    DWORD hardware_id;
+    GUID container_id;
+    std::wstring product_name;
+    std::wstring xbox_name;
+};
+
+static DWORD gamepad_hardware_id(const wchar_t* instance_id)
+{
+    std::wstring id(instance_id);
+    std::transform(id.begin(), id.end(), id.begin(), [](wchar_t character) { return std::towupper(character); });
+    // USB and HID use VID_/PID_. Bluetooth can use VID&/PID& instead.
+    auto read_id = [&](const wchar_t* usb_prefix, const wchar_t* bluetooth_prefix) {
+        auto offset = id.find(usb_prefix);
+        if (offset == std::wstring::npos) offset = id.find(bluetooth_prefix);
+        if (offset == std::wstring::npos) return WORD(0);
+        return LOWORD(std::wcstoul(id.c_str() + offset + 4, nullptr, 16));
+    };
+    const auto vendor = read_id(L"VID_", L"VID&");
+    const auto product = read_id(L"PID_", L"PID&");
+    return vendor && product ? MAKELONG(vendor, product) : 0;
+}
+
+static std::wstring gamepad_property(HDEVINFO devices, SP_DEVINFO_DATA& device, const DEVPROPKEY& key)
+{
+    wchar_t value[MAX_PATH]{};
+    DEVPROPTYPE type = 0;
+    if (SetupDiGetDevicePropertyW(devices, &device, &key, &type, reinterpret_cast<PBYTE>(value),
+                                  sizeof(value), nullptr, 0) && type == DEVPROP_TYPE_STRING)
+        return value;
+    return {};
+}
+
+static std::vector<GamepadName> read_gamepad_names()
+{
+    struct DeviceList
+    {
+        HDEVINFO handle;
+        ~DeviceList() { if (handle != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList(handle); }
+    } devices{SetupDiGetClassDevsW(nullptr, nullptr, nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT)};
+    if (devices.handle == INVALID_HANDLE_VALUE) return {};
+
+    std::vector<GamepadName> names;
+    for (DWORD index = 0; ; ++index)
+    {
+        SP_DEVINFO_DATA device{sizeof(SP_DEVINFO_DATA)};
+        if (!SetupDiEnumDeviceInfo(devices.handle, index, &device)) break;
+        wchar_t instance_id[MAX_DEVICE_ID_LEN]{};
+        if (!SetupDiGetDeviceInstanceIdW(devices.handle, &device, instance_id, MAX_DEVICE_ID_LEN, nullptr))
+            continue;
+        const DWORD hardware_id = gamepad_hardware_id(instance_id);
+        if (!hardware_id) continue;
+
+        GUID container{};
+        DEVPROPTYPE type = 0;
+        if (!SetupDiGetDevicePropertyW(devices.handle, &device, &DEVPKEY_Device_ContainerId, &type,
+                                       reinterpret_cast<PBYTE>(&container), sizeof(container), nullptr, 0) ||
+            type != DEVPROP_TYPE_GUID) container = GUID{};
+
+        auto product = gamepad_property(devices.handle, device, DEVPKEY_Device_BusReportedDeviceDesc);
+        auto classification = gamepad_property(devices.handle, device, DEVPKEY_Device_Class);
+        std::wstring xbox_name;
+        if (classification == L"XboxComposite" || classification == L"XnaComposite")
+        {
+            xbox_name = gamepad_property(devices.handle, device, DEVPKEY_Device_FriendlyName);
+            if (xbox_name.empty()) xbox_name = gamepad_property(devices.handle, device, DEVPKEY_Device_DeviceDesc);
+        }
+        names.push_back({hardware_id, container, std::move(product), std::move(xbox_name)});
+    }
+    return names;
+}
+
+static std::vector<std::wstring> find_gamepad_names(DWORD hardware_id, const std::vector<GamepadName>& names)
+{
+    std::vector<std::wstring> matches;
+    int priority = 0;
+    auto consider = [&](const std::wstring& candidate, int rank) {
+        if (rank < priority || candidate.empty() || _wcsicmp(candidate.c_str(), L"Controller") == 0 ||
+            _wcsicmp(candidate.c_str(), L"Gamepad") == 0) return;
+        if (rank > priority)
+        {
+            matches.clear();
+            priority = rank;
+        }
+        auto same_name = [&](const std::wstring& name) { return _wcsicmp(name.c_str(), candidate.c_str()) == 0; };
+        if (std::none_of(matches.begin(), matches.end(), same_name)) matches.push_back(candidate);
+    };
+    for (const auto& match : names)
+    {
+        if (match.hardware_id != hardware_id) continue;
+        consider(match.product_name, 3);
+        consider(match.xbox_name, 2);
+        if (match.container_id == GUID{}) continue;
+        // An Xbox controller can expose a compatibility interface with a different PID.
+        for (const auto& sibling : names)
+            if (sibling.container_id == match.container_id) consider(sibling.xbox_name, 1);
+    }
+    std::sort(matches.begin(), matches.end());
+    return matches;
+}
+
+static std::string xinput_display_name(DWORD slot, DWORD hardware_id, const std::vector<GamepadName>& names)
+{
+    const auto number = std::to_string(slot + 1);
+    const auto fallback = "XInput Gamepad " + number;
+    const auto candidates = find_gamepad_names(hardware_id, names);
+    if (candidates.empty()) return fallback;
+
+    const auto slot_label = " (XInput " + number + ")";
+    const auto suffix = candidates.size() > 1 ? "+" + slot_label : slot_label;
+    char utf8[MAX_PATH]{};
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, candidates.front().c_str(), -1, utf8,
+                             MAX_PATH - static_cast<int>(suffix.size()), nullptr, nullptr))
+        return fallback;
+
+    // The first line is the display label. GEX uses subsequent lines in the device tooltip.
+    std::string label = utf8 + suffix;
+    for (auto name = std::next(candidates.begin()); name != candidates.end(); ++name)
+    {
+        const auto remaining = MAX_PATH - static_cast<int>(label.size()) - 1;
+        if (remaining > 1 && WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, name->c_str(), -1,
+                                                utf8, remaining, nullptr, nullptr))
+        {
+            label += '\n';
+            label += utf8;
+        }
+    }
+    return label;
+}
+
+static void connect_xinput_device(DWORD slot, const GUID& guid, const std::string& name)
+{
+    DeviceSummary summary{};
+    summary.device_guid = guid;
+    summary.joystick_id = slot;
+    strcpy_s(summary.name, MAX_PATH, name.c_str());
+    summary.axis_count = 6;
+    for (DWORD index = 0; index < summary.axis_count; ++index)
+        summary.axis_map[index] = {index + 1, index + 1};
+    summary.button_count = 10;
+    summary.hat_count = 1;
+    summary.usage_page = 1;
+    summary.usage = 5;
+    g_data_store.cache[guid] = summary;
+    g_data_store.state[guid] = DeviceState{};
+    g_data_store.active_guids.push_back(guid);
+    ++g_inventory_generation;
+    g_pending_devices.emplace_back(summary, DeviceActionType::Connected);
+    logger->info("XInput slot {} connected: {}", slot, guid_to_string(guid));
+}
+
+static void poll_xinput_devices(bool publish_input)
+{
+    if (!g_xinput_get_state || !g_xinput_get_capabilities) return;
+    const auto now = GetTickCount64();
+    const bool scan = now >= g_next_xinput_scan;
+    if (scan) g_next_xinput_scan = now + 500;
+    std::vector<GamepadName> names;
+    bool names_read = false;
+    for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot)
+    {
+        const GUID guid = xinput_guid(slot);
+        const bool connected = g_data_store.state.find(guid) != g_data_store.state.end();
+        if (!connected && !scan) continue;
+        XINPUT_STATE state{};
+        const DWORD result = g_xinput_get_state(slot, &state);
+        if (result == ERROR_DEVICE_NOT_CONNECTED && connected)
+        {
+            release_device_locked(guid, true);
+            g_next_xinput_scan = 0;
+            logger->info("XInput slot {} disconnected: {}", slot, guid_to_string(guid));
+        }
+        if (result != ERROR_SUCCESS) continue;
+        if (!connected)
+        {
+            XINPUT_CAPABILITIES capabilities{};
+            if (g_xinput_get_capabilities(slot, XINPUT_FLAG_GAMEPAD, &capabilities) != ERROR_SUCCESS ||
+                capabilities.SubType != XINPUT_DEVSUBTYPE_GAMEPAD) continue;
+            DWORD hardware_id = 0;
+            XInputExtendedCapabilities extended{};
+            if (g_xinput_get_extended_capabilities &&
+                g_xinput_get_extended_capabilities(1, slot, XINPUT_FLAG_GAMEPAD, &extended) == ERROR_SUCCESS &&
+                extended.vendor_id && extended.product_id)
+            {
+                hardware_id = MAKELONG(extended.vendor_id, extended.product_id);
+                if (!names_read)
+                {
+                    names = read_gamepad_names();
+                    names_read = true;
+                }
+            }
+            connect_xinput_device(slot, guid, xinput_display_name(slot, hardware_id, names));
+        }
+        if (publish_input) update_device_state(xinput_joystick_state(state.Gamepad), guid);
+    }
+}
+
 static void poll_devices_once()
 {
     {
         std::lock_guard<std::recursive_mutex> guard(g_data_mutex);
         if(g_initialization_done)
         {
+            poll_xinput_devices(true);
             for(const auto& entry : g_data_store.device_map)
             {
                 if(!entry.second || !g_data_store.is_ready[entry.first]) continue;
@@ -464,6 +747,7 @@ static void poll_devices_once()
             }
         }
     }
+    dispatch_device_events();
     dispatch_input_events();
 }
 
@@ -643,6 +927,33 @@ static void release_device_locked(GUID guid, bool notify)
     g_device_capabilities.erase(guid);
 }
 
+static bool is_xinput_duplicate(LPDIRECTINPUTDEVICE8 device, const GUID& guid, const std::string& name,
+                                  WORD usage_page, WORD usage, DWORD device_type)
+{
+    if (!g_xinput_get_state || !g_xinput_get_capabilities) return false;
+    // Keep non-gamepad HID devices, including wheels and flight sticks, on DirectInput.
+    if (usage_page != 0 && (usage_page != 1 || usage != 5)) return false;
+    if (usage_page == 0 && GET_DIDEVICE_TYPE(device_type) != DI8DEVTYPE_GAMEPAD) return false;
+
+    DIPROPGUIDANDPATH path{};
+    path.diph = {sizeof(path), sizeof(path.diph), 0, DIPH_DEVICE};
+    if (SUCCEEDED(device->GetProperty(DIPROP_GUIDANDPATH, &path.diph)))
+    {
+        std::wstring device_path(path.wszPath);
+        std::transform(device_path.begin(), device_path.end(), device_path.begin(),
+                       [](wchar_t character) { return static_cast<wchar_t>(std::towlower(character)); });
+        // XUSB compatibility devices use Windows' XInput interface-group marker.
+        if (device_path.find(L"&ig_") != std::wstring::npos) return true;
+    }
+
+    // Bluetooth XInput-compatible and native Xbox HID interfaces can omit the marker.
+    auto lower_name = name;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+                   [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+    return lower_name.find("xinput") != std::string::npos ||
+        (lower_name.find("xbox") != std::string::npos && get_vendor_id(device, guid) == 0x045E);
+}
+
 void initialize_device(GUID guid, std::string name, WORD usage_page, WORD usage)
 {
     release_device_locked(guid, true);
@@ -654,6 +965,16 @@ void initialize_device(GUID guid, std::string name, WORD usage_page, WORD usage)
     };
     HRESULT result = g_direct_input->CreateDevice(guid, &device, nullptr);
     if (FAILED(result) || !device) { fail(FAILED(result) ? result : E_POINTER, "CreateDevice"); return; }
+    DIDEVICEINSTANCE deviceInfo{};
+    deviceInfo.dwSize = sizeof(deviceInfo);
+    result = device->GetDeviceInfo(&deviceInfo);
+    if (SUCCEEDED(result)) { usage_page = deviceInfo.wUsagePage; usage = deviceInfo.wUsage; }
+    else logger->warn("{}: GetDeviceInfo failed; using enumeration metadata: {}", guid_to_string(guid), error_to_string(result));
+    if (is_xinput_duplicate(device, guid, name, usage_page, usage, deviceInfo.dwDevType))
+    {
+        device->Release();
+        return;
+    }
     result = device->SetCooperativeLevel(nullptr, DISCL_NONEXCLUSIVE | DISCL_BACKGROUND);
     if (FAILED(result)) { fail(result, "SetCooperativeLevel"); return; }
     result = device->SetDataFormat(&c_dfDIJoystick2);
@@ -662,11 +983,6 @@ void initialize_device(GUID guid, std::string name, WORD usage_page, WORD usage)
     capabilities.dwSize = sizeof(capabilities);
     result = device->GetCapabilities(&capabilities);
     if (FAILED(result)) { fail(result, "GetCapabilities"); return; }
-    DIDEVICEINSTANCE deviceInfo{};
-    deviceInfo.dwSize = sizeof(deviceInfo);
-    result = device->GetDeviceInfo(&deviceInfo);
-    if (SUCCEEDED(result)) { usage_page = deviceInfo.wUsagePage; usage = deviceInfo.wUsage; }
-    else logger->warn("{}: GetDeviceInfo failed; using enumeration metadata: {}", guid_to_string(guid), error_to_string(result));
     std::vector<int> axes;
     result = enumerate_formatted_axes(device, axes);
     if (FAILED(result)) { fail(result, "GetObjectInfo formatted axes"); return; }
@@ -742,7 +1058,9 @@ static HRESULT enumerate_devices_locked()
 #ifdef DILL_TESTING
     if (g_test_enumerate) return g_test_enumerate();
 #endif
+    const bool first_enumeration = !g_initialization_done;
     g_initialization_done = false;
+    load_xinput();
     if (!g_direct_input)
     {
         HRESULT result = DirectInput8Create(GetModuleHandle(nullptr), DIRECTINPUT_VERSION, IID_IDirectInput8,
@@ -758,6 +1076,8 @@ static HRESULT enumerate_devices_locked()
     for (const auto& entry : g_data_store.device_map)
         if (current.find(entry.first) == current.end()) removed.push_back(entry.first);
     for (const auto& guid : removed) release_device_locked(guid, true);
+    g_next_xinput_scan = 0;
+    if (first_enumeration) poll_xinput_devices(false);
     g_initialization_done = true;
     return S_OK;
 }
@@ -792,6 +1112,12 @@ static void release_all_devices()
     g_device_errors.clear();
     g_device_capabilities.clear();
     g_poll_failures.clear();
+    g_next_xinput_scan = 0;
+    g_xinput_get_state = nullptr;
+    g_xinput_get_capabilities = nullptr;
+    g_xinput_get_extended_capabilities = nullptr;
+    g_xinput_checked = false;
+    if (g_xinput_module) { FreeLibrary(g_xinput_module); g_xinput_module = nullptr; }
     if (g_direct_input) { g_direct_input->Release(); g_direct_input = nullptr; }
 }
 
@@ -820,7 +1146,7 @@ BOOL init()
     if (g_running && WaitForSingleObject(g_stop_event, 0) == WAIT_TIMEOUT)
     { api_success(); return TRUE; }
     if (g_message_thread || g_joystick_thread) stop_and_join_threads();
-    logger->info("Initializing DILL v1.6.1.0 (managed lifecycle, API 2)");
+    logger->info("Initializing DILL v1.6.2.0 (managed lifecycle, API 2)");
     g_stop_event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     g_ready_event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     g_startup_error = S_OK;

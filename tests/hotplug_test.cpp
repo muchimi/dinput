@@ -34,9 +34,103 @@ static void on_device(DeviceSummary event, DeviceActionType action)
     ++device_callbacks;
 }
 
+static XINPUT_STATE fake_pads[XUSER_MAX_COUNT]{};
+static DWORD fake_pad_status[XUSER_MAX_COUNT] = {
+    ERROR_SUCCESS, ERROR_SUCCESS, ERROR_DEVICE_NOT_CONNECTED, ERROR_SUCCESS
+};
+
+static DWORD WINAPI read_fake_pad(DWORD slot, XINPUT_STATE* state)
+{
+    *state = fake_pads[slot];
+    return fake_pad_status[slot];
+}
+
+static DWORD WINAPI read_fake_pad_capabilities(DWORD slot, DWORD flags, XINPUT_CAPABILITIES* caps)
+{
+    require(flags == XINPUT_FLAG_GAMEPAD);
+    caps->SubType = slot == 3 ? XINPUT_DEVSUBTYPE_WHEEL : XINPUT_DEVSUBTYPE_GAMEPAD;
+    return ERROR_SUCCESS;
+}
+
+static void check_xinput_names()
+{
+    const auto compatibility = gamepad_hardware_id(L"HID\\VID_045E&PID_02FF&IG_00\\instance");
+    const auto usb = gamepad_hardware_id(L"USB\\VID_045E&PID_02D1\\instance");
+    const auto bluetooth = gamepad_hardware_id(L"HID\\{GUID}_VID&0002045E_PID&0B13\\instance");
+    require(compatibility == MAKELONG(0x045E, 0x02FF));
+    require(usb == MAKELONG(0x045E, 0x02D1));
+    require(bluetooth == MAKELONG(0x045E, 0x0B13));
+    require(!gamepad_hardware_id(L"HID\\Unknown"));
+    const GUID xbox_container{0x3};
+    std::vector<GamepadName> names = {
+        {usb, xbox_container, L"Controller", L"Xbox One Controller"},
+        {compatibility, xbox_container, {}, {}},
+        {bluetooth, {}, L"Xbox Wireless Controller", {}},
+    };
+    require(xinput_display_name(0, compatibility, names) == "Xbox One Controller (XInput 1)");
+    require(xinput_display_name(1, bluetooth, names) == "Xbox Wireless Controller (XInput 2)");
+    names.push_back({bluetooth, {}, L"Other Controller", {}});
+    names.push_back({bluetooth, {}, L"other controller", {}});
+    require(xinput_display_name(1, bluetooth, names) ==
+            "Other Controller+ (XInput 2)\nXbox Wireless Controller");
+    require(xinput_display_name(3, 0, names) == "XInput Gamepad 4");
+}
+
+static void check_xinput()
+{
+    g_xinput_get_state = read_fake_pad;
+    g_xinput_get_capabilities = read_fake_pad_capabilities;
+    const auto first = xinput_guid(0);
+    const auto second = xinput_guid(1);
+    require(first != second);
+    fake_pads[0].Gamepad = {
+        XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_RIGHT_THUMB | XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT,
+        255, 128, 12000, -32768, -1234, 2000
+    };
+    fake_pads[1].Gamepad.wButtons = XINPUT_GAMEPAD_B;
+
+    set_input_event_callback(on_input);
+    poll_xinput_devices(false);
+    require(get_device_count() == 2 && g_pending_devices.size() == 2 && g_pending_inputs.empty());
+    require(device_exists(first) && device_exists(second) && !device_exists(xinput_guid(3)));
+    auto summary = get_device_information_by_guid(first);
+    require(summary.joystick_id == 0 && summary.axis_count == 6 && summary.button_count == 10);
+    require(summary.usage_page == 1 && summary.usage == 5 && summary.hat_count == 1);
+    poll_xinput_devices(true);
+    require(get_axis(first, 1) == 12000 && get_axis(first, 2) == 32767);
+    require(get_axis(first, 3) == 32767 && get_axis(first, 6) == 128);
+    require(get_axis(first, 4) == -1234 && get_axis(first, 5) == -2000);
+    require(get_button(first, 1) && get_button(first, 10) && get_hat(first, 1) == 4500);
+    require(get_button(second, 2) && !get_button(second, 1));
+    auto input_events = g_pending_inputs.size();
+    require(input_events == 12);
+    poll_xinput_devices(true);
+    require(g_pending_inputs.size() == input_events && g_pending_devices.size() == 2);
+
+    fake_pads[0] = {};
+    poll_xinput_devices(true);
+    require(get_axis(first, 3) == -32768 && !get_button(first, 1) && get_hat(first, 1) == -1);
+    fake_pad_status[0] = ERROR_DEVICE_NOT_CONNECTED;
+    poll_xinput_devices(true);
+    require(get_device_count() == 1 && !device_exists(first));
+    require(g_pending_devices.back().first.device_guid == first);
+    require(g_pending_devices.back().second == DeviceActionType::Disconnected);
+    fake_pad_status[0] = ERROR_SUCCESS;
+    poll_xinput_devices(true);
+    require(get_device_count() == 2 && device_exists(first));
+    require(g_pending_devices.back().first.device_guid == first);
+    require(g_pending_devices.back().second == DeviceActionType::Connected);
+    g_pending_inputs.clear();
+    g_pending_devices.clear();
+    set_input_event_callback(nullptr);
+    release_all_devices();
+}
+
 int main()
 {
     logger->set_level(spd::level::off);
+    check_xinput_names();
+    check_xinput();
     GUID key{0x12345678, 2, 3, {4, 5, 6, 7, 8, 9, 10, 11}};
     g_initialization_done = true;
     auto replace_store = [&] {
@@ -198,6 +292,6 @@ int main()
         require(shutdown());
         require(!g_message_thread && !g_joystick_thread && !g_stop_event && !g_ready_event && !g_message_window);
     }
-    std::cout << "Native concurrency, snapshots, axes, diagnostics, startup rollback, hotplug debounce and restart checks passed.\n";
+    std::cout << "Native XInput, concurrency, snapshots, axes, diagnostics, startup rollback, hotplug debounce and restart checks passed.\n";
     return 0;
 }
